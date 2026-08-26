@@ -365,6 +365,17 @@ impl ProfileRequirement {
             Self::RealtimeWebsocket => ServiceClass::RealtimeWebsocket,
         }
     }
+
+    pub(super) const fn requires_voice_owner(&self) -> bool {
+        match self {
+            Self::SpeechHttp { managed_voice, .. }
+            | Self::SpeechBatch { managed_voice, .. }
+            | Self::SpeechWebsocket { managed_voice, .. } => *managed_voice,
+            Self::GenerationHttp { .. }
+            | Self::TranscriptionHttp { .. }
+            | Self::RealtimeWebsocket { .. } => false,
+        }
+    }
 }
 
 impl ServiceProfile {

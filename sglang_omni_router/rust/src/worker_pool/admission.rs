@@ -68,7 +68,8 @@ impl Drop for WorkerLoadGuard {
 
 /// Admission and weighted worker load retained through response termination.
 pub(crate) struct RequestLease {
-    _admission: AdmissionLease,
+    _admission: Option<AdmissionLease>,
+    _envelope: Option<EnvelopeLease>,
     _capacity: Option<OwnedSemaphorePermit>,
     load: WorkerLoadGuard,
 }
@@ -77,7 +78,8 @@ impl RequestLease {
     pub(super) fn new(admission: AdmissionLease, registration: Arc<WorkerRecord>) -> Self {
         let weight = admission.credits;
         Self {
-            _admission: admission,
+            _admission: Some(admission),
+            _envelope: None,
             _capacity: None,
             load: WorkerLoadGuard::new(registration, weight),
         }
@@ -90,9 +92,19 @@ impl RequestLease {
     ) -> Self {
         let weight = admission.credits;
         Self {
-            _admission: admission,
+            _admission: Some(admission),
+            _envelope: None,
             _capacity: Some(capacity),
             load: WorkerLoadGuard::new(registration, weight),
+        }
+    }
+
+    pub(super) fn new_owner(envelope: EnvelopeLease, registration: Arc<WorkerRecord>) -> Self {
+        Self {
+            _admission: None,
+            _envelope: Some(envelope),
+            _capacity: None,
+            load: WorkerLoadGuard::new(registration, 1),
         }
     }
 
