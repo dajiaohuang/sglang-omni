@@ -16,10 +16,9 @@ pub(crate) use admission::{
 };
 pub(crate) use health::{HealthSupervisor, WorkerHealth};
 pub(crate) use profile::{
-    BatchFeature, CapacityClass, ChatAudioFormat, MediaPlacement, MediaProfile, MessageContentForm,
-    ModelSelection, ProfileRequirement, ReferenceForm, RouteRequirement, ServiceClass,
-    SpeechResponseFormat, SpeechTask, SpeechToTextTask, StreamMode, TranscriptionResponseFormat,
-    TrustDomain,
+    CapacityClass, ChatAudioFormat, MediaPlacement, MessageContentForm, ModelSelection,
+    ProfileRequirement, ReferenceForm, RouteRequirement, ServiceClass, SpeechResponseFormat,
+    SpeechTask, SpeechToTextTask, StreamMode, TranscriptionResponseFormat, TrustDomain,
 };
 pub(crate) use resolver::ResolvedTarget;
 
@@ -1067,7 +1066,6 @@ mod tests {
             reference_forms: vec![ReferenceForm::None],
             managed_voice: false,
             max_batch_size: 8,
-            effective_features: Vec::new(),
         }
     }
 
@@ -1155,7 +1153,6 @@ mod tests {
                 reference_forms: vec![ReferenceForm::None],
                 managed_voice: false,
                 batch_size: 3,
-                effective_features: Vec::new(),
             },
             TrustDomain::new(String::from("local")),
         );
@@ -1177,7 +1174,6 @@ mod tests {
                 reference_forms: vec![ReferenceForm::None],
                 managed_voice: false,
                 batch_size: 5,
-                effective_features: Vec::new(),
             },
             TrustDomain::new(String::from("local")),
         );
