@@ -91,7 +91,10 @@ async fn handle(
     } else {
         generation.buffered_max
     };
-    if framing.content_length > maximum {
+    if framing
+        .content_length
+        .is_some_and(|length| length > maximum)
+    {
         return Err(HttpFault::RequestBodyTooLarge);
     }
     let admission = generation
@@ -100,13 +103,12 @@ async fn handle(
         .map_err(map_admission)?;
 
     if let Some(proof) = proof {
-        let length = framing.content_length;
         let lease = proof.dispatch(admission).map_err(map_dispatch)?;
         let outgoing = OutgoingRequest::direct(
             CHAT_PATH,
             canonical_content_type(),
             request.into_body(),
-            Some(length),
+            framing.content_length,
             generation.streamed_max,
             deadline,
         );
@@ -119,7 +121,7 @@ async fn handle(
         .relay
         .read_buffered(
             request.into_body(),
-            Some(framing.content_length),
+            framing.content_length,
             generation.buffered_max,
             deadline,
         )
