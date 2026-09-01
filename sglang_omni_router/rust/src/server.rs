@@ -10,7 +10,7 @@ use axum::routing::{any, get};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, trace};
 
@@ -18,6 +18,7 @@ use crate::config::{Config, HttpMediaRoute};
 use crate::error::RouterError;
 use crate::http_generation::{self, HttpGeneration};
 use crate::http_media::{self, HttpMedia};
+use crate::http_relay::HttpRelay;
 use crate::lifecycle::Lifecycle;
 use crate::request_id::{self, RequestIds};
 use crate::shutdown;
@@ -41,8 +42,19 @@ struct AppState {
 pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     let lifecycle = Arc::new(Lifecycle::starting());
     let pool = Arc::new(WorkerPool::build(&config)?);
-    let generation = HttpGeneration::build(&config, Arc::clone(&pool))?;
-    let media = HttpMedia::build(&config, Arc::clone(&pool))?;
+    let relay = HttpRelay::new(
+        pool.http_client(),
+        config
+            .http
+            .buffered_total_usize()
+            .map_err(RouterError::Config)?,
+    );
+    let generation = HttpGeneration::build(
+        &config,
+        Arc::clone(&pool),
+        Arc::clone(&relay),
+    )?;
+    let media = HttpMedia::build(&config, Arc::clone(&pool), relay)?;
     let request_ids = RequestIds::new();
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;
     let app = route_table(

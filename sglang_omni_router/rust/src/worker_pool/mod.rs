@@ -81,8 +81,7 @@ pub(crate) struct WorkerPool {
     homogeneous_generation_http: Vec<HomogeneousGenerationCohort>,
     homogeneous_media_http: Vec<HomogeneousMediaCohort>,
     health_client: reqwest::Client,
-    generation_client: Option<reqwest::Client>,
-    media_client: Option<reqwest::Client>,
+    http_client: reqwest::Client,
 }
 
 struct HomogeneousGenerationCohort {
@@ -123,30 +122,12 @@ impl WorkerPool {
             .ok_or(crate::error::RouterError::WorkerPoolInvariant)?;
         let health_client = build_health_client(config.health.timeout(), config.health.interval())
             .map_err(crate::error::RouterError::HealthClient)?;
-        let generation_client = config
-            .http_generation
-            .as_ref()
-            .map(|generation| {
-                build_http_client(
-                    generation.connect_timeout(),
-                    generation.pool_idle_timeout(),
-                    generation.pool_max_idle_per_host,
-                )
-            })
-            .transpose()
-            .map_err(crate::error::RouterError::GenerationClient)?;
-        let media_client = config
-            .http_media
-            .as_ref()
-            .map(|media| {
-                build_http_client(
-                    media.connect_timeout(),
-                    media.pool_idle_timeout(),
-                    media.pool_max_idle_per_host,
-                )
-            })
-            .transpose()
-            .map_err(crate::error::RouterError::MediaClient)?;
+        let http_client = build_http_client(
+            config.http.connect_timeout(),
+            config.http.pool_idle_timeout(),
+            config.http.pool_max_idle_per_host,
+        )
+        .map_err(crate::error::RouterError::HttpClient)?;
         let admission_limit = |limit: Option<u32>| {
             limit
                 .map(usize::try_from)
@@ -186,8 +167,7 @@ impl WorkerPool {
             homogeneous_generation_http,
             homogeneous_media_http,
             health_client,
-            generation_client,
-            media_client,
+            http_client,
         })
     }
 
@@ -201,12 +181,8 @@ impl WorkerPool {
         )
     }
 
-    pub(crate) fn generation_client(&self) -> Option<reqwest::Client> {
-        self.generation_client.clone()
-    }
-
-    pub(crate) fn media_client(&self) -> Option<reqwest::Client> {
-        self.media_client.clone()
+    pub(crate) fn http_client(&self) -> reqwest::Client {
+        self.http_client.clone()
     }
 
     pub(crate) fn try_admit(
@@ -649,8 +625,7 @@ mod tests {
             admission: AdmissionController::new(admission, [Some(admission), None, None, None]),
             selector: Selector::new(strategy),
             health_client: client.clone(),
-            generation_client: Some(client),
-            media_client: None,
+            http_client: client,
         }
     }
 
@@ -1053,8 +1028,7 @@ mod tests {
             admission: AdmissionController::new(8, [Some(8), Some(8), Some(8), Some(8)]),
             selector: Selector::new(RoutingStrategy::RoundRobin),
             health_client: client.clone(),
-            generation_client: None,
-            media_client: Some(client),
+            http_client: client,
         }
     }
 
