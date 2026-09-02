@@ -71,7 +71,7 @@ pub(super) fn speech_with_hints(
         .map(|value| classify_task(value).ok_or(HttpFault::MalformedRequest))
         .transpose()?;
     let references = reference_forms(&fields);
-    let managed_voice = classify_managed_voice(&fields, &references);
+    let managed_voice = pool.voice_state_enabled() && classify_managed_voice(&fields, &references);
     Ok(Classified {
         requirement: RouteRequirement::new(
             ProfileRequirement::SpeechHttp {
@@ -133,7 +133,9 @@ pub(super) fn batch_with_hints(
         .map(|value| classify_task(value).ok_or(HttpFault::MalformedRequest))
         .transpose()?;
     let default_references = reference_forms(&defaults);
-    let mut managed_voice = classify_managed_voice(&defaults, &default_references);
+    let voice_state_enabled = pool.voice_state_enabled();
+    let mut managed_voice =
+        voice_state_enabled && classify_managed_voice(&defaults, &default_references);
     for item in items {
         let effective_model = item
             .model
@@ -178,7 +180,8 @@ pub(super) fn batch_with_hints(
             .clone()
             .flatten()
             .or_else(|| defaults.voice.clone().flatten());
-        managed_voice |= !explicit_reference
+        managed_voice |= voice_state_enabled
+            && !explicit_reference
             && voice
                 .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"));
     }
@@ -502,7 +505,7 @@ mod tests {
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-    fn pool() -> WorkerPool {
+    fn pool_with_voice_state(voice_state_enabled: bool) -> WorkerPool {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "sgl-omni-media-classify-{}-{sequence}.toml",
@@ -519,6 +522,7 @@ format = "json"
 filter = "error"
 [router]
 strategy = "round_robin"
+{voice_owner}
 [admission]
 global = 16
 generation_http = 1
@@ -561,7 +565,7 @@ response_formats = ["mp3", "opus", "aac", "flac", "wav"]
 stream_modes = ["non_streaming"]
 tasks = ["text_to_speech", "voice_clone", "voice_design"]
 reference_forms = ["none", "direct", "list", "vq_codes"]
-managed_voice = false
+managed_voice = {managed_voice}
 [[workers.service_profiles]]
 service = "speech_http"
 model_ids = ["tts", "other"]
@@ -569,14 +573,14 @@ response_formats = ["pcm"]
 stream_modes = ["non_streaming", "streaming"]
 tasks = ["text_to_speech", "voice_clone", "voice_design"]
 reference_forms = ["none", "direct", "list", "vq_codes"]
-managed_voice = false
+managed_voice = {managed_voice}
 [[workers.service_profiles]]
 service = "speech_batch"
 model_ids = ["tts", "other"]
 response_formats = ["mp3", "opus", "aac", "flac", "wav", "pcm"]
 tasks = ["text_to_speech", "voice_clone", "voice_design"]
 reference_forms = ["none", "direct", "list", "vq_codes"]
-managed_voice = false
+managed_voice = {managed_voice}
 max_batch_size = 16
 [[workers.service_profiles]]
 service = "transcription_http"
@@ -584,11 +588,27 @@ model_ids = ["tts", "other"]
 task = "transcribe"
 response_formats = ["json", "text", "verbose_json", "srt", "vtt", "sse"]
 stream_modes = ["non_streaming", "streaming"]
-"#;
+"#
+        .replace(
+            "{voice_owner}",
+            if voice_state_enabled {
+                "voice_owner_worker_id = \"worker\""
+            } else {
+                ""
+            },
+        )
+        .replace(
+            "{managed_voice}",
+            if voice_state_enabled { "true" } else { "false" },
+        );
         fs::write(&path, config).expect("write classifier config");
         let parsed = Config::load(&path).expect("load classifier config");
         let _removed = fs::remove_file(path);
         WorkerPool::build(&parsed).expect("build classifier pool")
+    }
+
+    fn pool() -> WorkerPool {
+        pool_with_voice_state(false)
     }
 
     #[test]
@@ -752,7 +772,7 @@ stream_modes = ["non_streaming", "streaming"]
 
     #[test]
     fn batch_default_named_voice_is_required_before_item_reference_overrides() {
-        let pool = pool();
+        let pool = pool_with_voice_state(true);
         let trust = TrustDomain::new(String::from("local"));
         let body = br#"{
             "model":"tts",
@@ -854,7 +874,7 @@ stream_modes = ["non_streaming", "streaming"]
 
     #[test]
     fn preserves_empty_whitespace_model_and_voice_semantics() {
-        let pool = pool();
+        let pool = pool_with_voice_state(true);
         let trust = TrustDomain::new(String::from("local"));
         for (body, defaulted, expected_model, managed) in [
             (
@@ -899,6 +919,39 @@ stream_modes = ["non_streaming", "streaming"]
                 batch(body.as_bytes(), &pool, &trust).expect("classify batch managed voice fact");
             let ProfileRequirement::SpeechBatch { managed_voice, .. } =
                 classified.requirement.profile()
+            else {
+                panic!("batch requirement")
+            };
+            assert_eq!(*managed_voice, expected);
+        }
+    }
+
+    #[test]
+    fn managed_voice_affinity_requires_voice_state() {
+        let trust = TrustDomain::new(String::from("local"));
+        for (pool, expected) in [
+            (pool_with_voice_state(false), false),
+            (pool_with_voice_state(true), true),
+        ] {
+            let speech = speech(
+                br#"{"model":"tts","input":"x","voice":"sample"}"#,
+                &pool,
+                &trust,
+            )
+            .expect("classify speech voice");
+            let ProfileRequirement::SpeechHttp { managed_voice, .. } = speech.requirement.profile()
+            else {
+                panic!("speech requirement")
+            };
+            assert_eq!(*managed_voice, expected);
+
+            let batch = batch(
+                br#"{"model":"tts","voice":"sample","items":[{"input":"x"}]}"#,
+                &pool,
+                &trust,
+            )
+            .expect("classify batch voice");
+            let ProfileRequirement::SpeechBatch { managed_voice, .. } = batch.requirement.profile()
             else {
                 panic!("batch requirement")
             };
