@@ -258,7 +258,10 @@ impl WorkerPool {
             if !owner.is_routable() {
                 return Err(DispatchError::Unavailable);
             }
-            return Ok(RequestLease::new(admission, Arc::clone(owner)));
+            let policy = self.selector.least_requests_guard();
+            let lease = RequestLease::new(admission, Arc::clone(owner));
+            drop(policy);
+            return Ok(lease);
         }
         let profile_found = matching[..self.records.len()].contains(&true);
         self.dispatch_matching(admission, profile_found, |record| {
@@ -311,6 +314,7 @@ impl WorkerPool {
             if !owner.is_routable() {
                 return Err(DispatchError::Unavailable);
             }
+            let policy = self.selector.least_requests_guard();
             let selection = self
                 .session_selection
                 .lock()
@@ -323,6 +327,7 @@ impl WorkerPool {
                 .map_err(|_| DispatchError::Overloaded)?;
             let lease = RequestLease::new_session(admission, permit, Arc::clone(owner));
             drop(selection);
+            drop(policy);
             return Ok(lease);
         }
 
@@ -401,10 +406,12 @@ impl WorkerPool {
     }
 
     pub(crate) fn voice_owner_ready(&self) -> bool {
-        self.voice_owner.as_ref().is_none_or(|owner| owner.is_routable())
+        self.voice_owner
+            .as_ref()
+            .is_none_or(|owner| owner.is_routable())
     }
 
-    pub(crate) fn dispatch_voice_control(
+    pub(crate) fn dispatch_voice_owner(
         &self,
         envelope: EnvelopeLease,
     ) -> Result<RequestLease, DispatchError> {
@@ -412,7 +419,10 @@ impl WorkerPool {
         if !owner.is_routable() {
             return Err(DispatchError::Unavailable);
         }
-        Ok(RequestLease::new_owner(envelope, Arc::clone(owner)))
+        let policy = self.selector.least_requests_guard();
+        let lease = RequestLease::new_owner(envelope, Arc::clone(owner));
+        drop(policy);
+        Ok(lease)
     }
 
     fn dispatch_matching(
@@ -1411,6 +1421,203 @@ mod tests {
             reference_forms: vec![ReferenceForm::None],
             managed_voice: false,
         }
+    }
+
+    fn voice_speech_record(ordinal: usize, managed_voice: bool) -> Arc<WorkerRecord> {
+        let health = AtomicHealth::unknown();
+        health.store(WorkerHealth::Healthy);
+        Arc::new(WorkerRecord {
+            worker_id: WorkerId::new(format!("voice-{ordinal}")),
+            default_model_id: Some(String::from("tts")),
+            registration_id: RegistrationId::from_startup_ordinal(ordinal),
+            target: ResolvedTarget::from_parts(
+                &format!("http://127.0.0.1:{}/", 13_000 + ordinal),
+                "/health",
+            )
+            .expect("voice target"),
+            trust_domain: TrustDomain::new(String::from("local")),
+            profiles: vec![
+                ServiceProfile::SpeechHttp {
+                    model_ids: vec![String::from("tts")],
+                    response_formats: vec![SpeechResponseFormat::Wav],
+                    stream_modes: vec![StreamMode::NonStreaming],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice,
+                },
+                ServiceProfile::SpeechBatch {
+                    model_ids: vec![String::from("tts")],
+                    response_formats: vec![SpeechResponseFormat::Wav],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice,
+                    max_batch_size: 8,
+                },
+                ServiceProfile::SpeechWebsocket {
+                    model_ids: vec![String::from("tts")],
+                    response_formats: vec![SpeechResponseFormat::Pcm],
+                    stream_modes: vec![StreamMode::NonStreaming],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice,
+                },
+            ],
+            active_requests: AtomicUsize::new(0),
+            session_capacity: [
+                Some(SessionCapacity {
+                    semaphore: Arc::new(Semaphore::new(1)),
+                }),
+                None,
+            ],
+            health,
+            immediate_probe: Notify::new(),
+        })
+    }
+
+    fn speech_requirement(managed_voice: bool) -> RouteRequirement {
+        RouteRequirement::new(
+            ProfileRequirement::SpeechHttp {
+                model: ModelSelection::Explicit(String::from("tts")),
+                response_format: SpeechResponseFormat::Wav,
+                stream_mode: StreamMode::NonStreaming,
+                task: Some(SpeechTask::TextToSpeech),
+                reference_forms: vec![ReferenceForm::None],
+                managed_voice,
+            },
+            TrustDomain::new(String::from("local")),
+        )
+    }
+
+    fn batch_requirement(managed_voice: bool) -> RouteRequirement {
+        RouteRequirement::new(
+            ProfileRequirement::SpeechBatch {
+                models: vec![ModelSelection::Explicit(String::from("tts"))],
+                response_formats: vec![SpeechResponseFormat::Wav],
+                tasks: vec![SpeechTask::TextToSpeech],
+                reference_forms: vec![ReferenceForm::None],
+                managed_voice,
+                batch_size: 1,
+            },
+            TrustDomain::new(String::from("local")),
+        )
+    }
+
+    fn speech_websocket_requirement(managed_voice: bool) -> RouteRequirement {
+        RouteRequirement::new(
+            ProfileRequirement::SpeechWebsocket {
+                model: ModelSelection::Explicit(String::from("tts")),
+                response_format: Some(SpeechResponseFormat::Pcm),
+                stream_mode: StreamMode::NonStreaming,
+                task: Some(SpeechTask::TextToSpeech),
+                reference_forms: vec![ReferenceForm::None],
+                managed_voice,
+            },
+            TrustDomain::new(String::from("local")),
+        )
+    }
+
+    #[test]
+    fn voice_owner_dispatch_is_exact_and_mixed_speech_requires_classification() {
+        for strategy in [RoutingStrategy::RoundRobin, RoutingStrategy::LeastRequests] {
+            let owner = voice_speech_record(0, true);
+            let non_owner = voice_speech_record(1, false);
+            let mut pool = media_pool(vec![Arc::clone(&owner), Arc::clone(&non_owner)]);
+            pool.selector = Selector::new(strategy);
+            pool.voice_owner = Some(Arc::clone(&owner));
+            pool.homogeneous_media_http =
+                build_content_blind_media_cohorts(&pool.records, pool.voice_owner.as_ref());
+            pool.admission =
+                AdmissionController::new(8, [None, Some(4), Some(4), None, Some(4), None]);
+
+            assert!(pool.voice_owner_ready());
+            assert!(
+                pool.content_blind_media_http(
+                    &TrustDomain::new(String::from("local")),
+                    crate::config::HttpMediaRoute::Speech,
+                )
+                .is_none()
+            );
+
+            for (class, managed, stateless) in [
+                (
+                    CapacityClass::SpeechHttp,
+                    speech_requirement(true),
+                    speech_requirement(false),
+                ),
+                (
+                    CapacityClass::SpeechBatch,
+                    batch_requirement(true),
+                    batch_requirement(false),
+                ),
+            ] {
+                let managed = pool
+                    .dispatch(
+                        pool.try_admit(class, 1).expect("managed admission"),
+                        &managed,
+                    )
+                    .expect("managed dispatch");
+                assert_eq!(managed.registration_ordinal(), 0);
+                drop(managed);
+
+                let mut reached_non_owner = false;
+                for _ in 0..2 {
+                    let lease = pool
+                        .dispatch(
+                            pool.try_admit(class, 1).expect("stateless admission"),
+                            &stateless,
+                        )
+                        .expect("stateless policy dispatch");
+                    reached_non_owner |= lease.registration_ordinal() == 1;
+                }
+                assert!(reached_non_owner);
+            }
+
+            let websocket = speech_websocket_requirement(true);
+            let session = pool
+                .dispatch_session(
+                    pool.try_admit(CapacityClass::SpeechWebsocket, 1)
+                        .expect("managed session admission"),
+                    &websocket,
+                )
+                .expect("managed session dispatch");
+            assert_eq!(session.registration_ordinal(), 0);
+            drop(session);
+
+            let control = pool
+                .dispatch_voice_owner(pool.try_admit_envelope().expect("voice admission"))
+                .expect("exact owner dispatch");
+            assert_eq!(control.registration_ordinal(), 0);
+            assert_eq!(owner.load(), 1);
+            drop(control);
+            assert_eq!(owner.load(), 0);
+
+            owner.health.store(WorkerHealth::Unhealthy);
+            assert!(!pool.voice_owner_ready());
+            assert_eq!(
+                pool.dispatch_voice_owner(
+                    pool.try_admit_envelope()
+                        .expect("unhealthy owner admission"),
+                )
+                .err(),
+                Some(DispatchError::Unavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn owner_only_speech_keeps_content_blind_proof() {
+        let owner = voice_speech_record(0, true);
+        let mut pool = media_pool(vec![Arc::clone(&owner)]);
+        pool.voice_owner = Some(owner);
+        pool.homogeneous_media_http =
+            build_content_blind_media_cohorts(&pool.records, pool.voice_owner.as_ref());
+        assert!(
+            pool.content_blind_media_http(
+                &TrustDomain::new(String::from("local")),
+                crate::config::HttpMediaRoute::Speech,
+            )
+            .is_some()
+        );
     }
 
     #[test]
