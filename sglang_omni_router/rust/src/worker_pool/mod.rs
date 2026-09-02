@@ -24,9 +24,7 @@ pub(crate) use resolver::ResolvedTarget;
 
 use admission::AdmissionController;
 use health::AtomicHealth;
-use profile::{
-    MAX_WORKERS, RegistrationId, ServiceProfile, WorkerId, generation_cohort_is_homogeneous,
-};
+use profile::{MAX_WORKERS, RegistrationId, ServiceProfile, WorkerId};
 use resolver::{build_health_client, build_http_client};
 use selection::Selector;
 
@@ -394,38 +392,32 @@ impl WorkerPool {
 
 impl ContentBlindGenerationHttp<'_> {
     pub(crate) fn dispatch(self, admission: AdmissionLease) -> Result<RequestLease, DispatchError> {
-        self.pool.dispatch_matching(
-            admission,
-            true,
-            |record| {
-                &record.trust_domain == self.trust
-                    && record
-                        .profiles
-                        .iter()
-                        .any(|profile| profile.service_class() == ServiceClass::GenerationHttp)
-            },
-        )
+        self.pool.dispatch_matching(admission, true, |record| {
+            &record.trust_domain == self.trust
+                && record
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.service_class() == ServiceClass::GenerationHttp)
+        })
     }
 }
 
 impl ContentBlindMediaHttp<'_> {
     pub(crate) fn dispatch(self, admission: AdmissionLease) -> Result<RequestLease, DispatchError> {
-        self.pool
-            .dispatch_matching(admission, true, |record| {
-                record.trust_domain == self.cohort.trust_domain
-                    && record.profiles.iter().any(|profile| {
-                        profile.service_class() == self.cohort.service
-                            && match (profile, self.cohort.task) {
-                                (
-                                    ServiceProfile::TranscriptionHttp { task, .. },
-                                    Some(required),
-                                ) => *task == required,
-                                (ServiceProfile::TranscriptionHttp { .. }, None) => false,
-                                (_, None) => true,
-                                (_, Some(_)) => false,
+        self.pool.dispatch_matching(admission, true, |record| {
+            record.trust_domain == self.cohort.trust_domain
+                && record.profiles.iter().any(|profile| {
+                    profile.service_class() == self.cohort.service
+                        && match (profile, self.cohort.task) {
+                            (ServiceProfile::TranscriptionHttp { task, .. }, Some(required)) => {
+                                *task == required
                             }
-                    })
-            })
+                            (ServiceProfile::TranscriptionHttp { .. }, None) => false,
+                            (_, None) => true,
+                            (_, Some(_)) => false,
+                        }
+                })
+        })
     }
 }
 
@@ -659,7 +651,7 @@ mod tests {
         );
         assert!(replicas.content_blind_generation_http(&local).is_some());
 
-        let mut missing_default = record(0, "local", "omni", 1);
+        let mut missing_default = record(0, "local", "omni");
         Arc::get_mut(&mut missing_default)
             .expect("new test record is uniquely owned")
             .default_model_id = None;
@@ -1008,10 +1000,7 @@ mod tests {
         drop(lease);
     }
 
-    fn media_record(
-        ordinal: usize,
-        profile: ServiceProfile,
-    ) -> Arc<WorkerRecord> {
+    fn media_record(ordinal: usize, profile: ServiceProfile) -> Arc<WorkerRecord> {
         let health = AtomicHealth::unknown();
         health.store(WorkerHealth::Healthy);
         Arc::new(WorkerRecord {
@@ -1113,7 +1102,7 @@ mod tests {
     fn unrelated_media_only_worker_does_not_change_chat_cohort_or_readiness() {
         let generation = record(0, "local", "omni");
         let media = media_record(1, speech_profile());
-        let pool = media_pool(vec![media, generation]);
+        let pool = media_pool(vec![generation, media]);
         let trust = TrustDomain::new(String::from("local"));
         assert!(pool.generation_http_ready(&trust));
         let lease = pool

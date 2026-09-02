@@ -125,10 +125,10 @@ async fn handle(
     let classify_pool = Arc::clone(&generation.pool);
     let classify_trust = generation.trust.clone();
     let (upload, classified) = classify_blocking(deadline, move || {
-            let classified = classify(&upload.bytes, &classify_pool, &classify_trust)?;
-            Ok((upload, classified))
-        })
-        .await?;
+        let classified = classify(&upload.bytes, &classify_pool, &classify_trust)?;
+        Ok((upload, classified))
+    })
+    .await?;
     let lease = generation
         .pool
         .dispatch(admission, &classified.requirement)

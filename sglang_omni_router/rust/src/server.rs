@@ -10,7 +10,7 @@ use axum::routing::{any, get};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, trace};
 
@@ -49,11 +49,7 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
             .buffered_total_usize()
             .map_err(RouterError::Config)?,
     );
-    let generation = HttpGeneration::build(
-        &config,
-        Arc::clone(&pool),
-        Arc::clone(&relay),
-    )?;
+    let generation = HttpGeneration::build(&config, Arc::clone(&pool), Arc::clone(&relay))?;
     let media = HttpMedia::build(&config, Arc::clone(&pool), relay)?;
     let request_ids = RequestIds::new();
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;

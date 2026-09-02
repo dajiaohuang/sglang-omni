@@ -224,18 +224,18 @@ async fn handle(
     let classify_pool = Arc::clone(&media.pool);
     let classify_trust = media.trust.clone();
     let (upload, classified) = classify_blocking(deadline, move || {
-            let classified = classify(
-                route,
-                &upload.bytes,
-                boundary.as_deref(),
-                route_model.as_deref(),
-                route_stream,
-                &classify_pool,
-                &classify_trust,
-            )?;
-            Ok((upload, classified))
-        })
-        .await?;
+        let classified = classify(
+            route,
+            &upload.bytes,
+            boundary.as_deref(),
+            route_model.as_deref(),
+            route_stream,
+            &classify_pool,
+            &classify_trust,
+        )?;
+        Ok((upload, classified))
+    })
+    .await?;
     if route == HttpMediaRoute::SpeechBatch
         && !media
             .pool
