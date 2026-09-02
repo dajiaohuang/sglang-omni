@@ -107,7 +107,6 @@ async fn handle(
             request.into_body(),
             framing.content_length,
             generation.streamed_max,
-            deadline,
         );
         return Arc::clone(&generation.relay)
             .send(outgoing, lease, request_id, deadline, sanitize_response)

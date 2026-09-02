@@ -156,7 +156,13 @@ impl HttpRelay {
                 return Err(fault);
             }
         };
-        if let Some(fault) = upload_fault(outgoing.upload.as_ref())? {
+        if let Err(fault) = require_completed_upload(&outgoing.upload) {
+            if fault == HttpFault::UpstreamProtocolError {
+                tracing::warn!(
+                    worker = %lease.target().base_url(),
+                    "worker responded before the request upload completed"
+                );
+            }
             return Err(fault);
         }
         let response: axum::http::Response<reqwest::Body> = response.into();
@@ -169,7 +175,7 @@ impl HttpRelay {
                 return Err(fault);
             }
         };
-        let relay = DirectResponseBody::new(body, lease, outgoing.upload, deadline);
+        let relay = DirectResponseBody::new(body, lease);
         let mut downstream = Response::new(Body::new(relay));
         *downstream.status_mut() = parts.status;
         *downstream.headers_mut() = headers;
@@ -200,10 +206,9 @@ impl OutgoingRequest {
         body: Body,
         expected: Option<u64>,
         maximum: u64,
-        deadline: tokio::time::Instant,
     ) -> Self {
         let state = SharedUploadState::new(UploadState::Incomplete);
-        let direct = DirectRequestBody::new(body, expected, maximum, state.clone(), deadline);
+        let direct = DirectRequestBody::new(body, expected, maximum, state.clone());
         Self {
             path,
             content_type,
@@ -268,6 +273,14 @@ where
 
 pub(crate) fn snapshot_upload(state: &SharedUploadState) -> Result<UploadState, HttpFault> {
     state.snapshot()
+}
+
+fn require_completed_upload(upload: &Option<SharedUploadState>) -> Result<(), HttpFault> {
+    match upload.as_ref().map(snapshot_upload).transpose()? {
+        Some(UploadState::Incomplete) => Err(HttpFault::UpstreamProtocolError),
+        Some(UploadState::Failed(fault)) => Err(fault),
+        Some(UploadState::Complete) | None => Ok(()),
+    }
 }
 
 fn upload_fault(upload: Option<&SharedUploadState>) -> Result<Option<HttpFault>, HttpFault> {
@@ -335,7 +348,8 @@ mod tests {
 
     use super::{
         HttpFault, HttpRelay, SharedUploadState, UploadState, check_precommit_deadline_at,
-        classify_blocking, deadline_fault, initial_buffer_capacity, upload_fault,
+        classify_blocking, deadline_fault, initial_buffer_capacity, require_completed_upload,
+        upload_fault,
     };
 
     struct AlwaysReady;
@@ -423,9 +437,14 @@ mod tests {
             Err(HttpFault::RequestTimeout)
         );
         assert_eq!(upload_fault(Some(&upload)), Ok(None));
+        assert_eq!(
+            require_completed_upload(&Some(upload.clone())),
+            Err(HttpFault::UpstreamProtocolError)
+        );
         upload
             .publish(UploadState::Complete)
             .expect("update upload state");
+        assert_eq!(require_completed_upload(&Some(upload.clone())), Ok(()));
         assert_eq!(deadline_fault(Some(&upload)), HttpFault::UpstreamTimeout);
         upload
             .publish(UploadState::Failed(HttpFault::MalformedRequest))
