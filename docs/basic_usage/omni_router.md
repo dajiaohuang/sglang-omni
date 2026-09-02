@@ -271,10 +271,11 @@ Managed voices have one explicit owner configured by
 `router.voice_owner_worker_id`. Voice CRUD and requests that depend on a stored
 voice are pinned to that worker. Stateless speech continues to use normal
 worker selection. The router does not store, replicate, or reconcile
-worker-local voice data. A service profile with `managed_voice = true` declares
-that its worker can resolve names from its local voice store. Multiple eligible
-managed-voice workers must share that store unless requests are pinned to one
-owner.
+worker-local voice data. When voice state is enabled, a nonempty, non-default
+voice without an explicit reference is conservatively treated as owner-bound.
+A service profile with `managed_voice = true` declares that its worker can
+resolve names from its local voice store. Multiple eligible managed-voice
+workers must share that store unless requests are pinned to one owner.
 
 ## Health and Readiness
 
