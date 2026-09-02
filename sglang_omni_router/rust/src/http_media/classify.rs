@@ -5,8 +5,8 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 use crate::error::HttpFault;
 use crate::speech_facts::{
     SpeechFields, effective_reference_forms, managed_voice as classify_managed_voice,
-    read_field as read_speech_field, reference_forms, response_format as classify_response_format,
-    task as classify_task,
+    read_field as read_speech_field, read_stream as read_speech_stream, reference_forms,
+    response_format as classify_response_format, task as classify_task,
 };
 use crate::worker_pool::{
     DefaultModelResolution, ModelSelection, ProfileRequirement, ReferenceForm, RouteRequirement,
@@ -400,7 +400,7 @@ impl<'de> Visitor<'de> for RootVisitor {
         let mut items = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
-                "stream" => fields.stream = Some(map.next_value()?),
+                "stream" => read_speech_stream(&mut map, &mut fields)?,
                 "items" if matches!(self.0, RootMode::Batch) => {
                     items = Some(map.next_value_seed(ItemsSeed)?)
                 }
@@ -667,6 +667,38 @@ stream_modes = ["non_streaming", "streaming"]
             assert_eq!(reference_forms, &[ReferenceForm::List]);
             assert!(!managed_voice, "voice takes precedence over speaker");
         }
+    }
+
+    #[test]
+    fn speech_facts_are_tolerant_last_wins_and_payload_bounded() {
+        let pool = pool();
+        let trust = TrustDomain::new(String::from("local"));
+        let audio = "A".repeat(7 * 1_024 * 1_024);
+        let body = format!(
+            r#"{{"model":7,"model":"tts","response_format":"pcm","stream":{{}},"stream":"true","ref_audio":5,"ref_audio":"{audio}","input":"x"}}"#
+        );
+        let classified = speech(body.as_bytes(), &pool, &trust)
+            .expect("final valid routing facts replace malformed earlier values");
+        let ProfileRequirement::SpeechHttp {
+            model,
+            stream_mode,
+            reference_forms,
+            ..
+        } = classified.requirement.profile()
+        else {
+            panic!("speech requirement")
+        };
+        assert!(matches!(model, ModelSelection::Explicit(_)));
+        assert_eq!(*stream_mode, StreamMode::Streaming);
+        assert_eq!(reference_forms, &[ReferenceForm::Direct]);
+
+        let final_invalid = speech(br#"{"model":"tts","model":7,"input":"x"}"#, &pool, &trust)
+            .expect("invalid final worker-owned value becomes an absent routing fact");
+        let ProfileRequirement::SpeechHttp { model, .. } = final_invalid.requirement.profile()
+        else {
+            panic!("speech requirement")
+        };
+        assert!(matches!(model, ModelSelection::WorkerDefault { .. }));
     }
 
     #[test]

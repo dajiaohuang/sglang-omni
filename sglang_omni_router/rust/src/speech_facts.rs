@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -13,7 +14,7 @@ pub(crate) struct SpeechFields {
     pub(crate) task: Option<Option<String>>,
     pub(crate) voice: Option<Option<String>>,
     voice_present: bool,
-    pub(crate) ref_audio: Option<Option<String>>,
+    pub(crate) ref_audio: Option<bool>,
     pub(crate) references: Option<Option<ReferenceFlags>>,
 }
 
@@ -33,24 +34,35 @@ where
     A: MapAccess<'de>,
 {
     match key {
-        "model" => fields.model = Some(map.next_value()?),
-        "response_format" => fields.response_format = Some(map.next_value()?),
-        "task_type" => fields.task = Some(map.next_value()?),
+        "model" => fields.model = Some(map.next_value_seed(ScalarFactSeed)?.into_string()),
+        "response_format" => {
+            fields.response_format = Some(map.next_value_seed(ScalarFactSeed)?.into_string())
+        }
+        "task_type" => fields.task = Some(map.next_value_seed(ScalarFactSeed)?.into_string()),
         "voice" => {
-            fields.voice = Some(map.next_value()?);
+            fields.voice = Some(map.next_value_seed(ScalarFactSeed)?.into_string());
             fields.voice_present = true;
         }
         "speaker" => {
-            let value = map.next_value()?;
+            let value = map.next_value_seed(ScalarFactSeed)?.into_string();
             if !fields.voice_present {
                 fields.voice = Some(value);
             }
         }
-        "ref_audio" => fields.ref_audio = Some(map.next_value()?),
-        "references" => fields.references = Some(map.next_value_seed(NullableReferencesSeed)?),
+        "ref_audio" => fields.ref_audio = Some(map.next_value_seed(ScalarFactSeed)?.is_string()),
+        "references" => fields.references = Some(map.next_value_seed(ReferencesFactSeed)?),
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+/// Reads a Pydantic-compatible boolean routing fact without rejecting other worker-owned values.
+pub(crate) fn read_stream<'de, A>(map: &mut A, fields: &mut SpeechFields) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+{
+    fields.stream = Some(map.next_value_seed(ScalarFactSeed)?.into_bool());
+    Ok(())
 }
 
 pub(crate) fn response_format(value: &str) -> Option<SpeechResponseFormat> {
@@ -76,10 +88,7 @@ pub(crate) fn task(value: &str) -> Option<SpeechTask> {
 }
 
 pub(crate) fn reference_forms(fields: &SpeechFields) -> Vec<ReferenceForm> {
-    collect_reference_forms(
-        fields.ref_audio.as_ref().is_some_and(Option::is_some),
-        fields.references.flatten(),
-    )
+    collect_reference_forms(fields.ref_audio == Some(true), fields.references.flatten())
 }
 
 pub(crate) fn effective_reference_forms(
@@ -88,9 +97,8 @@ pub(crate) fn effective_reference_forms(
 ) -> Vec<ReferenceForm> {
     let has_ref_audio = item
         .ref_audio
-        .as_ref()
-        .and_then(Option::as_ref)
-        .or_else(|| defaults.ref_audio.as_ref().and_then(Option::as_ref))
+        .filter(|present| *present)
+        .or_else(|| defaults.ref_audio.filter(|present| *present))
         .is_some();
     let references = item
         .references
@@ -130,21 +138,171 @@ pub(crate) fn managed_voice(fields: &SpeechFields, references: &[ReferenceForm])
             .is_some_and(|voice| !voice.is_empty() && !voice.eq_ignore_ascii_case("default"))
 }
 
-struct NullableReferencesSeed;
+pub(crate) enum ScalarFact<'a> {
+    String(Cow<'a, str>),
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+    Other,
+}
 
-impl<'de> DeserializeSeed<'de> for NullableReferencesSeed {
+impl ScalarFact<'_> {
+    pub(crate) fn into_string(self) -> Option<String> {
+        match self {
+            Self::String(value) => Some(value.into_owned()),
+            _ => None,
+        }
+    }
+
+    fn into_bool(self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(value),
+            Self::Signed(value) => bool_from_integer(value),
+            Self::Unsigned(value) => bool_from_integer(value),
+            Self::Float(0.0) => Some(false),
+            Self::Float(1.0) => Some(true),
+            Self::String(value) => parse_bool_fact(&value),
+            Self::Float(_) | Self::Other => None,
+        }
+    }
+
+    fn is_string(&self) -> bool {
+        matches!(self, Self::String(_))
+    }
+}
+
+pub(crate) struct ScalarFactSeed;
+
+impl<'de> DeserializeSeed<'de> for ScalarFactSeed {
+    type Value = ScalarFact<'de>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ScalarVisitor;
+        impl<'de> Visitor<'de> for ScalarVisitor {
+            type Value = ScalarFact<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a scalar or worker-owned value")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(ScalarFact::String(Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(ScalarFact::String(Cow::Owned(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(ScalarFact::String(Cow::Owned(value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ScalarFact::Other)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ScalarFact::Other)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(ScalarFact::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(ScalarFact::Signed(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(ScalarFact::Unsigned(value))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(ScalarFact::Float(value))
+            }
+
+            fn visit_seq<A>(self, sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                ignore_sequence(sequence)?;
+                Ok(ScalarFact::Other)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                ignore_map(map)?;
+                Ok(ScalarFact::Other)
+            }
+        }
+        deserializer.deserialize_any(ScalarVisitor)
+    }
+}
+
+fn bool_from_integer<T>(value: T) -> Option<bool>
+where
+    T: Eq + From<u8>,
+{
+    if value == T::from(0) {
+        Some(false)
+    } else if value == T::from(1) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn parse_bool_fact(value: &str) -> Option<bool> {
+    if ["1", "on", "t", "true", "y", "yes"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Some(true)
+    } else if ["0", "off", "f", "false", "n", "no"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+struct ReferencesFactSeed;
+
+impl<'de> DeserializeSeed<'de> for ReferencesFactSeed {
     type Value = Option<ReferenceFlags>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct OptionalVisitor;
-        impl<'de> Visitor<'de> for OptionalVisitor {
+        struct ReferencesVisitor;
+        impl<'de> Visitor<'de> for ReferencesVisitor {
             type Value = Option<ReferenceFlags>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("null or a reference array")
+                formatter.write_str("a reference array or worker-owned value")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut flags = ReferenceFlags::default();
+                while let Some(entry) = sequence.next_element_seed(ReferenceFactSeed)? {
+                    if let Some(entry) = entry {
+                        flags.list = true;
+                        flags.vq_codes |= entry.vq_codes;
+                    }
+                }
+                Ok(Some(flags))
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E> {
@@ -155,43 +313,42 @@ impl<'de> DeserializeSeed<'de> for NullableReferencesSeed {
                 Ok(None)
             }
 
-            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
             where
-                D: serde::Deserializer<'de>,
+                A: MapAccess<'de>,
             {
-                deserializer.deserialize_seq(ReferencesVisitor).map(Some)
+                ignore_map(map)?;
+                Ok(None)
             }
         }
-        deserializer.deserialize_option(OptionalVisitor)
+        deserializer.deserialize_any(ReferencesVisitor)
     }
 }
 
-struct ReferencesVisitor;
+struct ReferenceFactSeed;
 
-impl<'de> Visitor<'de> for ReferencesVisitor {
-    type Value = ReferenceFlags;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a reference array")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut flags = ReferenceFlags::default();
-        while let Some(entry) = sequence.next_element_seed(ReferenceSeed)? {
-            flags.list = true;
-            flags.vq_codes |= entry.vq_codes;
-        }
-        Ok(flags)
-    }
-}
-
-struct ReferenceSeed;
-
-impl<'de> DeserializeSeed<'de> for ReferenceSeed {
-    type Value = ReferenceFlags;
+impl<'de> DeserializeSeed<'de> for ReferenceFactSeed {
+    type Value = Option<ReferenceFlags>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
@@ -199,29 +356,82 @@ impl<'de> DeserializeSeed<'de> for ReferenceSeed {
     {
         struct ReferenceVisitor;
         impl<'de> Visitor<'de> for ReferenceVisitor {
-            type Value = ReferenceFlags;
+            type Value = Option<ReferenceFlags>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a speech reference object")
+                formatter.write_str("a speech reference object or worker-owned value")
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                let mut flags = ReferenceFlags::default();
+                let mut vq_codes = false;
                 while let Some(key) = map.next_key::<String>()? {
-                    if matches!(key.as_str(), "audio_path" | "ref_audio" | "audio" | "data") {
-                        flags.list |= map.next_value::<Option<IgnoredAny>>()?.is_some();
-                    } else if key == "vq_codes" {
-                        flags.vq_codes = map.next_value::<Option<IgnoredAny>>()?.is_some();
+                    if key == "vq_codes" {
+                        vq_codes = map.next_value::<Option<IgnoredAny>>()?.is_some();
                     } else {
                         let _ignored = map.next_value::<IgnoredAny>()?;
                     }
                 }
-                Ok(flags)
+                Ok(Some(ReferenceFlags {
+                    list: true,
+                    vq_codes,
+                }))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_seq<A>(self, sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                ignore_sequence(sequence)?;
+                Ok(None)
             }
         }
-        deserializer.deserialize_map(ReferenceVisitor)
+        deserializer.deserialize_any(ReferenceVisitor)
     }
+}
+
+fn ignore_sequence<'de, A>(mut sequence: A) -> Result<(), A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    while sequence.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn ignore_map<'de, A>(mut map: A) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+{
+    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+    Ok(())
 }
