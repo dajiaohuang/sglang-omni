@@ -164,8 +164,7 @@ FRONTEND_DIR = Path(__file__).parent / "frontend"
 register_playground_favicon(app, frontend_dir=FRONTEND_DIR)
 _register_filesystem(app)
 _register_home(app)
-if not FRONTEND_DIR.is_dir():
-    raise ValueError(f"Frontend directory does not exist: {FRONTEND_DIR}")
+assert FRONTEND_DIR.is_dir(), "Frontend directory does not exist"
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True))
 logger.info(f"Serving playground UI from {FRONTEND_DIR}")
 

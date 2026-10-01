@@ -48,6 +48,66 @@ def test_voxtral_tts_config_uses_current_stage_schema() -> None:
     )
 
 
+def test_voxtral_stage_factories_preserve_generation_placement_and_resolve_vocoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.voxtral_tts.pipeline import engine_builder
+
+    captured: dict[str, object] = {}
+
+    class FakeBuilder:
+        def build(self, model_path, **kwargs):
+            captured["build"] = (model_path, kwargs)
+            return "generation"
+
+    monkeypatch.setattr(engine_builder, "VoxtralTtsEngineBuilder", FakeBuilder)
+    generation = stages.create_generation_executor("model", gpu_id=3)
+
+    assert generation == "generation"
+    assert captured["build"] == (
+        "model",
+        {
+            "device": None,
+            "gpu_id": 3,
+            "server_args_overrides": None,
+        },
+    )
+
+    stages.create_generation_executor("model", device="cuda:2", gpu_id=5)
+    assert captured["build"] == (
+        "model",
+        {
+            "device": "cuda:2",
+            "gpu_id": 5,
+            "server_args_overrides": None,
+        },
+    )
+
+    seen_devices: list[str] = []
+    resolved_devices: list[tuple[str | None, int | None]] = []
+    import sglang_omni.utils.device as device_mod
+
+    monkeypatch.setattr(
+        device_mod,
+        "resolve_concrete_device",
+        lambda device, gpu_id: (
+            resolved_devices.append((device, gpu_id)) or f"npu:{gpu_id}"
+        ),
+    )
+    monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        stages,
+        "load_audio_tokenizer",
+        lambda _checkpoint, config, device: (
+            seen_devices.append(device) or SimpleNamespace()
+        ),
+    )
+
+    stages.create_vocoder_executor("model", gpu_id=4)
+    assert resolved_devices == [(None, 4)]
+    assert seen_devices == ["npu:4"]
+
+
 def test_voxtral_radix_cache_is_namespaced_by_voice() -> None:
     """Different voice embeddings must not share a placeholder-token cache prefix."""
     model = SimpleNamespace(
@@ -90,7 +150,7 @@ def test_voxtral_radix_cache_is_namespaced_by_voice() -> None:
 
 
 def test_voxtral_speech_validation_accepts_supported_fields() -> None:
-    stages._validate_voxtral_speech_params(
+    stages.validate_voxtral_speech_params(
         inputs="hello",
         params={
             "max_new_tokens": 128,
@@ -137,7 +197,7 @@ def test_voxtral_speech_validation_rejects_ignored_fields(
     field: str,
 ) -> None:
     with pytest.raises(ValueError, match=field):
-        stages._validate_voxtral_speech_params(
+        stages.validate_voxtral_speech_params(
             inputs=inputs,
             params=params,
             tts_params=tts_params,
@@ -147,7 +207,7 @@ def test_voxtral_speech_validation_rejects_ignored_fields(
 @pytest.mark.parametrize("audio_codes", [None, torch.empty((0, 0), dtype=torch.long)])
 def test_voxtral_vocoder_rejects_empty_audio_codes(audio_codes) -> None:
     with pytest.raises(ValueError, match="generated no audio codes"):
-        stages._ensure_non_empty_audio_codes(audio_codes)
+        stages.ensure_non_empty_audio_codes(audio_codes)
 
 
 def test_voxtral_audio_waveform_payload_is_compact() -> None:
@@ -173,6 +233,31 @@ def test_voxtral_audio_codes_payload_is_compact() -> None:
     assert restored.audio_codes.tolist() == [[1, 2], [3, 4]]
 
 
+def test_voxtral_audio_attention_accepts_non_contiguous_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.voxtral_tts import audio_tokenizer
+
+    monkeypatch.setattr(audio_tokenizer, "HAS_FLASH_ATTN", False)
+    attention = audio_tokenizer.Attention(
+        SimpleNamespace(
+            n_heads=2,
+            n_kv_heads=2,
+            attn_sliding_window_size=8,
+            dim=4,
+            head_dim=2,
+            use_biases=False,
+            qk_norm=False,
+            causal=True,
+        ),
+        layer_id=0,
+    )
+
+    output = attention(torch.randn(3, 4))
+
+    assert output.shape == (3, 4)
+
+
 def test_voxtral_vocoder_preserves_warmup_trim_and_fade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -189,7 +274,7 @@ def test_voxtral_vocoder_preserves_warmup_trim_and_fade(
     monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
     monkeypatch.setattr(
         stages,
-        "_load_audio_tokenizer",
+        "load_audio_tokenizer",
         lambda *args, **kwargs: FakeAudioTokenizer(),
     )
 
@@ -204,10 +289,10 @@ def test_voxtral_vocoder_preserves_warmup_trim_and_fade(
         ).to_dict(),
     )
 
-    result = asyncio.run(scheduler._fn(payload))
+    result = asyncio.run(scheduler.fn(payload))
 
-    assert scheduler._max_batch_size == 1
-    assert scheduler._max_batch_wait_s == 0
+    assert scheduler.max_batch_size == 1
+    assert scheduler.max_batch_wait_s == 0
     assert [codes.tolist() for codes in seen_codes] == [
         [[9, 10], [9, 10], [9, 10], [11, 12]]
     ]
@@ -230,8 +315,8 @@ def test_voxtral_collect_audio_step_reuses_output_tokens_for_eos_filter() -> Non
 
     eos_id = AudioSpecialTokens.id(AudioSpecialTokens.end_audio)
     runner = VoxtralTTSModelRunner.__new__(VoxtralTTSModelRunner)
-    runner._pending_audio_codes = None
-    runner._pending_audio_embeds = None
+    runner.pending_audio_codes = None
+    runner.pending_audio_embeds = None
     runner.model = SimpleNamespace(
         acoustic_transformer=lambda hidden: torch.tensor(
             [[11, 12, 13], [eos_id, 21, 22]], dtype=torch.long
@@ -260,7 +345,7 @@ def test_voxtral_collect_audio_step_reuses_output_tokens_for_eos_filter() -> Non
         ),
     ]
 
-    runner._collect_audio_step(result, schedule_batch, requests)
+    runner.collect_audio_step(result, schedule_batch, requests)
 
     assert result.next_token_ids.tolist() == [11, eos_id]
     assert requests[0].data.output_codes == []
@@ -290,7 +375,7 @@ def test_voxtral_decode_writes_feedback_buffer_for_standard_forward() -> None:
     runner = VoxtralTTSModelRunner.__new__(VoxtralTTSModelRunner)
     runner.model = SimpleNamespace(
         hidden_size=3,
-        _decode_input_embed_buffer=torch.zeros(2, 3, dtype=torch.float16),
+        decode_input_embed_buffer=torch.zeros(2, 3, dtype=torch.float16),
     )
     first = SimpleNamespace(
         data=SimpleNamespace(
@@ -306,7 +391,7 @@ def test_voxtral_decode_writes_feedback_buffer_for_standard_forward() -> None:
     assert result is None
     assert not first.data.pending_feedback_queue
     assert torch.equal(
-        runner.model._decode_input_embed_buffer,
+        runner.model.decode_input_embed_buffer,
         torch.tensor(
             [[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]],
             dtype=torch.float16,
@@ -320,14 +405,14 @@ def test_voxtral_decode_empty_batch_keeps_feedback_buffer() -> None:
     runner = VoxtralTTSModelRunner.__new__(VoxtralTTSModelRunner)
     runner.model = SimpleNamespace(
         hidden_size=3,
-        _decode_input_embed_buffer=torch.ones(1, 3, dtype=torch.float16),
+        decode_input_embed_buffer=torch.ones(1, 3, dtype=torch.float16),
     )
 
     result = runner.before_decode(object(), object(), [])
 
     assert result is None
     assert torch.equal(
-        runner.model._decode_input_embed_buffer,
+        runner.model.decode_input_embed_buffer,
         torch.ones(1, 3, dtype=torch.float16),
     )
 
@@ -357,7 +442,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
         hidden_size = 3
 
         def __init__(self) -> None:
-            self._decode_input_embed_buffer = torch.zeros(1, 3)
+            self.decode_input_embed_buffer = torch.zeros(1, 3)
 
         def acoustic_transformer(self, hidden):
             assert hidden.shape == (1, 3)
@@ -380,7 +465,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
             )
 
     class FakeOutputProcessor:
-        _capture_hidden = False
+        capture_hidden = False
 
         def process(self, model_output, scheduler_output):
             del model_output
@@ -414,7 +499,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
 
     assert output.can_run_cuda_graph is True
     assert torch.equal(
-        runner.model._decode_input_embed_buffer,
+        runner.model.decode_input_embed_buffer,
         torch.tensor([[1.0, 2.0, 3.0]]),
     )
 
@@ -423,9 +508,7 @@ def test_voxtral_forward_returns_graph_compatible_logits() -> None:
     from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
 
     model = VoxtralSGLangTTSModel.__new__(VoxtralSGLangTTSModel)
-    model._decode_input_embed_buffer = torch.arange(6, dtype=torch.float32).reshape(
-        2, 3
-    )
+    model.decode_input_embed_buffer = torch.arange(6, dtype=torch.float32).reshape(2, 3)
 
     def fake_language_model(input_ids, positions, forward_batch, input_embeds=None):
         del input_ids, positions, forward_batch
@@ -490,12 +573,12 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     )
     monkeypatch.setattr(
         stages,
-        "_write_voxtral_sglang_config",
+        "write_voxtral_sglang_config",
         lambda checkpoint_dir: f"{checkpoint_dir}/config.json",
     )
     monkeypatch.setattr(
         stages,
-        "_load_voxtral_voice_embeddings",
+        "load_voxtral_voice_embeddings",
         lambda checkpoint_dir, device: {},
     )
     monkeypatch.setattr(
@@ -566,7 +649,10 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
-    scheduler = stages.create_generation_executor("model", device="cuda:0")
+    from sglang_omni.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cuda", raising=False)
+    scheduler = stages.create_generation_executor("model", device="cuda", gpu_id=0)
 
     assert build_kwargs["disable_cuda_graph"] is False
     assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16]
@@ -591,7 +677,7 @@ def test_enable_inductor_gemm_autotune_sets_per_shape_autotuning() -> None:
     try:
         inductor_config.max_autotune_gemm = False
         inductor_config.max_autotune_gemm_backends = "ATEN"
-        stages._enable_inductor_gemm_autotune()
+        stages.enable_inductor_gemm_autotune()
         assert inductor_config.max_autotune_gemm is True
         assert inductor_config.max_autotune_gemm_backends == "TRITON,ATEN"
     finally:
