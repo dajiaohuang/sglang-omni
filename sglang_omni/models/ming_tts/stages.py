@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from transformers import PretrainedConfig
 
 from sglang_omni.models.ming_tts.audio_config import resolve_ming_tts_audio_vae_config
 from sglang_omni.models.ming_tts.config import (
@@ -26,8 +29,12 @@ from sglang_omni.models.ming_tts.hf_config import (
     register_ming_tts_hf_config,
 )
 from sglang_omni.models.ming_tts.request_builders import preprocess_ming_tts_payload
+from sglang_omni.models.ming_tts.streaming_vocoder import (
+    MingTTSStreamingVocoderScheduler,
+)
 from sglang_omni.models.ming_tts.tokenizer import load_ming_tts_tokenizer
 from sglang_omni.models.ming_tts.weight_loading import load_ming_tts_audio_vae_weights
+from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 from sglang_omni.utils.gpu_memory import (
@@ -45,25 +52,37 @@ if TYPE_CHECKING:
         AudioVAE,
     )
     from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
+    from sglang_omni.models.ming_tts.engine_io import MingTTSSGLangRequestData
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+else:
+    pass
 
 
-def _resolve_audio_vae_dtype(dtype: str | torch.dtype) -> torch.dtype:
+def resolve_audio_vae_dtype(dtype: str | torch.dtype) -> torch.dtype:
     import torch
 
     if isinstance(dtype, torch.dtype):
         return dtype
+    else:
+        pass
     if dtype == "auto":
         return torch.bfloat16
+    else:
+        pass
     if isinstance(dtype, str):
         value = dtype.removeprefix("torch.")
         torch_dtype = getattr(torch, value, None)
         if isinstance(torch_dtype, torch.dtype):
             return torch_dtype
+        else:
+            pass
         raise ValueError(f"Unsupported Ming-Omni-TTS AudioVAE dtype: {dtype!r}")
+    else:
+        pass
     raise TypeError(f"Unsupported Ming-Omni-TTS AudioVAE dtype: {dtype!r}")
 
 
-def _load_ming_tts_audio_vae(
+def load_ming_tts_audio_vae(
     checkpoint_dir: str,
     audio_config: AudioVAEconfig,
     *,
@@ -81,11 +100,13 @@ def _load_ming_tts_audio_vae(
             "Ming-Omni-TTS serving currently uses the talker AudioVAE "
             "encode/decode path and does not support semantic_module_kwargs"
         )
+    else:
+        pass
 
     audio_vae = AudioVAE(audio_config).eval()
     audio_vae.to(
         device=torch.device(device),
-        dtype=_resolve_audio_vae_dtype(dtype),
+        dtype=resolve_audio_vae_dtype(dtype),
     )
     report = load_ming_tts_audio_vae_weights(checkpoint_dir, audio_vae)
     logger.info("%s", report.summary())
@@ -98,10 +119,10 @@ def create_preprocessing_executor(
     context_length: int | None = None,
     max_decode_steps_cap: int | None = None,
     max_concurrency: int = 1,
-) -> SimpleScheduler:
+) -> SimpleScheduler[StagePayload, StagePayload]:
     checkpoint_dir = _resolve_checkpoint(model_path)
-    config = _load_ming_tts_config(checkpoint_dir)
-    context_length = int(context_length or _resolve_context_length(config))
+    config = load_ming_tts_config(checkpoint_dir)
+    context_length = int(context_length or resolve_context_length(config))
     tokenizer = load_ming_tts_tokenizer(
         checkpoint_dir,
         llm_config=config.llm_config,
@@ -121,16 +142,16 @@ def create_preprocessing_executor(
 def create_sglang_tts_engine_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     context_length: int | None = None,
-    server_args_overrides: dict[str, Any] | None = None,
+    server_args_overrides: Mapping[str, object] | None = None,
     total_gpu_memory_fraction: float | None = None,
     tp_rank: int = 0,
     tp_size: int = 1,
     nccl_port: int | None = None,
-) -> Any:
+) -> OmniScheduler[MingTTSSGLangRequestData]:
     from sglang_omni.models.ming_tts.engine_builder import MingTtsEngineBuilder
 
     user_overrides = dict(server_args_overrides or {})
@@ -139,6 +160,8 @@ def create_sglang_tts_engine_executor(
             "Ming-Omni-TTS tts_engine tp_size conflicts with "
             f"server_args_overrides.tp_size={user_overrides['tp_size']!r}"
         )
+    else:
+        pass
     context_length = int(user_overrides.pop("context_length", context_length or 0) or 0)
 
     return MingTtsEngineBuilder(
@@ -156,14 +179,16 @@ def create_sglang_tts_engine_executor(
     )
 
 
-def create_tts_engine_executor(*args, **kwargs) -> Any:
+def create_tts_engine_executor(
+    *args, **kwargs
+) -> OmniScheduler[MingTTSSGLangRequestData]:
     return create_sglang_tts_engine_executor(*args, **kwargs)
 
 
 def create_reference_encode_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     context_length: int | None = None,
@@ -171,27 +196,27 @@ def create_reference_encode_executor(
     ref_audio_cache: bool = True,
     ref_audio_cache_max_items: int = 256,
     ref_audio_cache_max_bytes: int = 64 * 1024 * 1024,
-) -> SimpleScheduler:
+) -> SimpleScheduler[StagePayload, StagePayload]:
     from sglang_omni.models.ming_tts.reference_encode import (
         MingSpeakerEmbeddingExtractor,
         MingTTSReferenceEncoder,
     )
+    from sglang_omni.utils.device import resolve_concrete_device
 
+    device = str(resolve_concrete_device(device, gpu_id))
     checkpoint_dir = _resolve_checkpoint(model_path)
-    config = _load_ming_tts_config(checkpoint_dir)
-    context_length = int(context_length or _resolve_context_length(config))
+    config = load_ming_tts_config(checkpoint_dir)
+    context_length = int(context_length or resolve_context_length(config))
     tokenizer = load_ming_tts_tokenizer(
         checkpoint_dir,
         llm_config=config.llm_config,
     )
-    if gpu_id is not None:
-        device = f"cuda:{gpu_id}"
 
     audio_config = resolve_ming_tts_audio_vae_config(
         config.audio_tokenizer_config,
         attn_implementation=MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
     )
-    audio_vae = _load_ming_tts_audio_vae(
+    audio_vae = load_ming_tts_audio_vae(
         checkpoint_dir,
         audio_config,
         device=device,
@@ -220,7 +245,7 @@ def create_reference_encode_executor(
 def create_audio_decode_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     keep_latents: bool = False,
@@ -232,7 +257,7 @@ def create_audio_decode_executor(
     max_batch_wait_ms: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
     total_gpu_memory_fraction: float | None = None,
     process_total_gpu_memory_fraction: float | None = None,
-) -> Any:
+) -> MingTTSStreamingVocoderScheduler:
     validate_ming_tts_audio_decode_cadence_config(
         initial_chunk_patches=initial_chunk_patches,
         steady_chunk_patches=steady_chunk_patches,
@@ -244,6 +269,8 @@ def create_audio_decode_executor(
     validate_ming_tts_audio_decode_stream_slots(stream_slots)
     if not isinstance(streaming_cuda_graph, bool):
         raise ValueError("Ming-Omni-TTS streaming_cuda_graph must be a boolean")
+    else:
+        pass
 
     import torch
 
@@ -260,11 +287,17 @@ def create_audio_decode_executor(
     ):
         if value is None:
             continue
+        else:
+            pass
         if isinstance(value, bool) or not isinstance(value, Real):
             raise TypeError(f"Ming-Omni-TTS {name} must be a real number")
+        else:
+            pass
         value = float(value)
         if not math.isfinite(value) or not 0.0 < value <= 1.0:
             raise ValueError(f"Ming-Omni-TTS {name} must be finite and in (0, 1]")
+        else:
+            pass
         if name == "total_gpu_memory_fraction":
             component_fraction = value
         else:
@@ -274,6 +307,8 @@ def create_audio_decode_executor(
             "Ming-Omni-TTS streaming AudioVAE CUDA graph requires "
             "process_total_gpu_memory_fraction"
         )
+    else:
+        pass
     if (
         component_fraction is not None
         and process_fraction is not None
@@ -283,45 +318,51 @@ def create_audio_decode_executor(
             "Ming-Omni-TTS process_total_gpu_memory_fraction must be greater "
             "than or equal to total_gpu_memory_fraction"
         )
+    else:
+        pass
 
     if gpu_id is not None:
         if isinstance(gpu_id, bool) or not isinstance(gpu_id, int):
             raise TypeError("Ming-Omni-TTS gpu_id must be an integer")
+        else:
+            pass
         if gpu_id < 0:
             raise ValueError("Ming-Omni-TTS gpu_id must be non-negative")
-        resolved_device = torch.device("cuda", gpu_id)
+        else:
+            pass
     else:
-        try:
-            resolved_device = torch.device(device)
-        except (TypeError, RuntimeError) as exc:
-            raise ValueError(
-                f"Invalid Ming-Omni-TTS audio decode device: {device!r}"
-            ) from exc
+        pass
+    from sglang_omni.utils.device import resolve_concrete_device
+
+    resolved_device = resolve_concrete_device(device, gpu_id)
     if resolved_device.type != "cuda" or not torch.cuda.is_available():
         raise ValueError(
             "Ming-Omni-TTS fixed AudioVAE serving requires an available CUDA device"
         )
+    else:
+        pass
     logical_gpu_id = resolved_device.index
-    if logical_gpu_id is None:
-        logical_gpu_id = torch.cuda.current_device()
-    if logical_gpu_id < 0 or logical_gpu_id >= torch.cuda.device_count():
+    if logical_gpu_id >= torch.cuda.device_count():
         raise ValueError(
             f"Ming-Omni-TTS audio decode GPU {logical_gpu_id} is not visible"
         )
-    resolved_device = torch.device("cuda", logical_gpu_id)
+    else:
+        pass
 
-    resolved_dtype = _resolve_audio_vae_dtype(dtype)
+    resolved_dtype = resolve_audio_vae_dtype(dtype)
     if resolved_dtype != torch.bfloat16:
         raise ValueError(
             "Ming-Omni-TTS fixed AudioVAE serving requires bfloat16, "
             f"got {resolved_dtype}"
         )
+    else:
+        pass
 
     device_info = get_gpu_device_info(logical_gpu_id)
     pre_process_bytes = get_process_gpu_memory_bytes(logical_gpu_id)
 
     checkpoint_dir = _resolve_checkpoint(model_path)
-    config = _load_ming_tts_config(checkpoint_dir)
+    config = load_ming_tts_config(checkpoint_dir)
 
     audio_config = resolve_ming_tts_audio_vae_config(
         config.audio_tokenizer_config,
@@ -333,9 +374,13 @@ def create_audio_decode_executor(
         raise ValueError(
             "Ming-Omni-TTS audio patch size and latent dimension must be positive"
         )
+    else:
+        pass
     decoder_latent_dim = audio_config.dec_kwargs.get("latent_dim")
     if decoder_latent_dim is None:
         raise ValueError("Ming-Omni-TTS AudioVAE decoder config is missing latent_dim")
+    else:
+        pass
     try:
         decoder_latent_dim = int(decoder_latent_dim)
     except (TypeError, ValueError) as exc:
@@ -347,9 +392,11 @@ def create_audio_decode_executor(
             "Ming-Omni-TTS upstream and AudioVAE decoder latent dimensions "
             f"must match, got {latent_dim} and {decoder_latent_dim}"
         )
+    else:
+        pass
     max_step_latents = max(initial_chunk_patches, steady_chunk_patches) * patch_size
 
-    audio_vae = _load_ming_tts_audio_vae(
+    audio_vae = load_ming_tts_audio_vae(
         checkpoint_dir,
         audio_config,
         device=resolved_device,
@@ -411,6 +458,8 @@ def create_audio_decode_executor(
                     f"budget={format_bytes_gib(process_budget_bytes)}, "
                     f"process_fraction={process_fraction}"
                 )
+            else:
+                pass
             memory_verification = "verified"
 
         logger.info(
@@ -451,18 +500,20 @@ def create_audio_decode_executor(
     return scheduler
 
 
-def _load_ming_tts_config(model_path: str) -> Any:
+def load_ming_tts_config(model_path: str) -> PretrainedConfig:
     register_ming_tts_hf_config()
     from transformers import AutoConfig
 
     return AutoConfig.from_pretrained(model_path, trust_remote_code=False)
 
 
-def _resolve_context_length(config: Any) -> int:
+def resolve_context_length(config: PretrainedConfig) -> int:
     llm_config = config.llm_config
     value = getattr(llm_config, "max_position_embeddings", None)
     if value is None:
         raise ValueError("Ming-Omni-TTS llm_config is missing max_position_embeddings")
+    else:
+        pass
     return int(value)
 
 
